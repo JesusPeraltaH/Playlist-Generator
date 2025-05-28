@@ -9,6 +9,9 @@ import requests
 from io import BytesIO
 from spotipy.oauth2 import SpotifyOAuth
 from spotify_api import connect_to_spotify, get_suggestions_from_api, create_spotify_playlist as create_spotify_playlist_api, reconnect_spotify_api, search_spotify_artist, get_playlist_tracks_from_api
+from music_ai import MusicRecommender
+import pygame
+import time
 
 
 
@@ -25,9 +28,13 @@ class SpotifyPlaylistCreator:
         self.client_secret = None
         self.redirect_uri = 'http://localhost:8888/callback' # Default redirect URI
         self.image_cache = {}
+        self.similar_images_cache = {}  # Cache for similar suggestions images
+        self.recommender = None
+        self.current_preview = None
         self.setup_credentials()
         self.setup_ui()
         self.setup_environment()
+        self.setup_audio()
         self.image_cache = {}
 
     def setup_credentials(self):
@@ -37,6 +44,10 @@ class SpotifyPlaylistCreator:
         load_dotenv(find_dotenv())
         self.client_id = os.getenv('SPOTIPY_CLIENT_ID')
         self.client_secret = os.getenv('SPOTIPY_CLIENT_SECRET')
+
+    def setup_audio(self):
+        """Inicializa el sistema de audio."""
+        pygame.mixer.init()
 
     def setup_ui(self):
         # Artist input
@@ -48,6 +59,10 @@ class SpotifyPlaylistCreator:
         self.add_button = ttk.Button(self.artist_frame, text="Add Artist", command=self.add_artist)
         self.add_button.pack(side=tk.LEFT)
 
+        # Menú contextual para las sugerencias
+        self.track_info_menu = tk.Menu(self.root, tearoff=0)
+        self.track_info_menu.add_command(label="Ver Detalles", command=self._show_track_details_from_list)
+        
         # Artist list
         self.artist_list_widget = tk.Listbox(self.root, height=5, width=50)
         self.artist_list_widget.pack(padx=10, pady=5, fill=tk.X)
@@ -60,16 +75,13 @@ class SpotifyPlaylistCreator:
         # Bind doble clic en la lista de artistas
         self.artist_list_widget.bind("<Double-Button-1>", self.get_suggestions_for_artist)
 
-        # Suggestions label and Treeview
-        ttk.Label(self.root, text="Suggested Tracks:").pack(padx=10, pady=5, anchor=tk.W)
+        # Frame principal para sugerencias
+        suggestions_main_frame = ttk.Frame(self.root)
+        suggestions_main_frame.pack(padx=10, pady=5, fill=tk.BOTH, expand=True)
 
-        # Frame principal para sugerencias y botones
-        main_content_frame = ttk.Frame(self.root)
-        main_content_frame.pack(padx=10, pady=5, fill=tk.BOTH, expand=True)
-
-        # Frame para las sugerencias
-        self.suggestions_frame = ttk.Frame(main_content_frame)
-        self.suggestions_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        # Frame para las sugerencias normales
+        self.suggestions_frame = ttk.LabelFrame(suggestions_main_frame, text="Suggested Tracks")
+        self.suggestions_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
 
         # Frame para el Treeview de sugerencias
         tree_frame = ttk.Frame(self.suggestions_frame)
@@ -98,32 +110,71 @@ class SpotifyPlaylistCreator:
 
         # Añadir evento de doble clic
         self.suggestions_tree.bind("<Double-1>", self.add_selected_track_to_playlist)
-
-        # Frame para mostrar la imagen de la canción seleccionada
-        self.image_frame = ttk.Frame(self.suggestions_frame)
-        self.image_frame.pack(side=tk.RIGHT, padx=10, pady=5)
-        self.image_label = ttk.Label(self.image_frame)
-        self.image_label.pack()
-
-        # Menú contextual para las sugerencias
-        self.track_info_menu = tk.Menu(self.root, tearoff=0)
-        self.track_info_menu.add_command(label="Ver Detalles", command=self._show_track_details_from_list)
-
-        self.suggestions_tree.bind("<Button-3>", self.show_track_context_menu_list)
         self.suggestions_tree.bind("<<TreeviewSelect>>", self.update_selected_image)
 
-        # Frame para los botones
-        button_frame = ttk.Frame(main_content_frame)
-        button_frame.pack(side=tk.RIGHT, padx=10, fill=tk.Y)
+        # Frame para sugerencias similares
+        self.similar_suggestions_frame = ttk.LabelFrame(suggestions_main_frame, text="Sugerencias Similares")
+        self.similar_suggestions_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(5, 0))
 
-        self.suggest_button = ttk.Button(button_frame, text="Get Suggestions", command=self.get_suggestions)
-        self.suggest_button.pack(pady=5, fill=tk.X)
-        self.create_button = ttk.Button(button_frame, text="Create Playlist", command=self.create_playlist)
-        self.create_button.pack(pady=5, fill=tk.X)
-        self.reconnect_button = ttk.Button(button_frame, text="Reconnect Spotify", command=self.reconnect_spotify)
-        self.reconnect_button.pack(pady=5, fill=tk.X)
-        self.view_playlist_btn = ttk.Button(button_frame, text="Ver Playlist", command=self.prompt_playlist_id)
-        self.view_playlist_btn.pack(pady=5, fill=tk.X)
+        # Frame para el Treeview de sugerencias similares
+        similar_tree_frame = ttk.Frame(self.similar_suggestions_frame)
+        similar_tree_frame.pack(fill=tk.BOTH, expand=True)
+
+        # Crear el Treeview con scrollbar para sugerencias similares
+        self.similar_suggestions_tree = ttk.Treeview(similar_tree_frame, columns=('name', 'artist', 'album'), selectmode="extended")
+        self.similar_suggestions_scrollbar = ttk.Scrollbar(similar_tree_frame, orient="vertical", command=self.similar_suggestions_tree.yview)
+        self.similar_suggestions_tree.configure(yscrollcommand=self.similar_suggestions_scrollbar.set)
+
+        # Configurar las columnas
+        self.similar_suggestions_tree.heading('#0', text='Imagen', anchor=tk.CENTER)
+        self.similar_suggestions_tree.heading('name', text='Canción', anchor=tk.W)
+        self.similar_suggestions_tree.heading('artist', text='Artista', anchor=tk.W)
+        self.similar_suggestions_tree.heading('album', text='Álbum', anchor=tk.W)
+
+        # Configurar el ancho de las columnas
+        self.similar_suggestions_tree.column('#0', width=100, minwidth=100)
+        self.similar_suggestions_tree.column('name', width=200, minwidth=150)
+        self.similar_suggestions_tree.column('artist', width=150, minwidth=100)
+        self.similar_suggestions_tree.column('album', width=200, minwidth=150)
+
+        # Empaquetar el Treeview y el scrollbar
+        self.similar_suggestions_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.similar_suggestions_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Frame para los botones de sugerencias
+        suggestions_buttons_frame = ttk.Frame(self.root)
+        suggestions_buttons_frame.pack(padx=10, pady=5, fill=tk.X)
+
+        # Botones para sugerencias normales
+        self.suggest_button = ttk.Button(suggestions_buttons_frame, text="Get Suggestions", command=self.get_suggestions)
+        self.suggest_button.pack(side=tk.LEFT, padx=5)
+        
+        # Botones para sugerencias similares
+        self.similar_songs_button = ttk.Button(suggestions_buttons_frame, text="Canciones Similares", command=self.get_similar_songs)
+        self.similar_songs_button.pack(side=tk.LEFT, padx=5)
+
+        # Frame para botones de playlist
+        playlist_buttons_frame = ttk.Frame(self.root)
+        playlist_buttons_frame.pack(padx=10, pady=5, fill=tk.X)
+
+        self.create_button = ttk.Button(playlist_buttons_frame, text="Create Playlist", command=self.create_playlist)
+        self.create_button.pack(side=tk.LEFT, padx=5)
+        
+        self.reconnect_button = ttk.Button(playlist_buttons_frame, text="Reconnect Spotify", command=self.reconnect_spotify)
+        self.reconnect_button.pack(side=tk.LEFT, padx=5)
+        
+        self.view_playlist_btn = ttk.Button(playlist_buttons_frame, text="Ver Playlist", command=self.prompt_playlist_id)
+        self.view_playlist_btn.pack(side=tk.LEFT, padx=5)
+
+        # Frame para controles de reproducción
+        self.playback_frame = ttk.LabelFrame(self.root, text="Reproducción")
+        self.playback_frame.pack(padx=10, pady=5, fill=tk.X)
+        
+        self.play_button = ttk.Button(self.playback_frame, text="▶️ Reproducir", command=self.play_preview)
+        self.play_button.pack(side=tk.LEFT, padx=5)
+        
+        self.stop_button = ttk.Button(self.playback_frame, text="⏹️ Detener", command=self.stop_preview)
+        self.stop_button.pack(side=tk.LEFT, padx=5)
 
         # Frame para la lista de canciones confirmadas
         self.tracks_frame = ttk.LabelFrame(self.root, text="Canciones Confirmadas")
@@ -136,21 +187,34 @@ class SpotifyPlaylistCreator:
         ttk.Button(btn_frame, text="Quitar Selección", command=self.remove_selected_tracks).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Actualizar Vista", command=self.refresh_tracks_view).pack(side=tk.LEFT, padx=5)
 
-        # Canvas y scrollbar para la cuadrícula de canciones confirmadas
-        self.tracks_canvas = tk.Canvas(self.tracks_frame)
-        self.tracks_scrollbar = ttk.Scrollbar(self.tracks_frame, orient="vertical", command=self.tracks_canvas.yview)
-        self.tracks_scrollable_frame = ttk.Frame(self.tracks_canvas)
+        # Crear Treeview para canciones confirmadas
+        self.confirmed_tracks_tree = ttk.Treeview(self.tracks_frame, columns=('name', 'artist'), selectmode='extended')
+        self.confirmed_tracks_tree.heading('#0', text='Imagen')
+        self.confirmed_tracks_tree.heading('name', text='Canción')
+        self.confirmed_tracks_tree.heading('artist', text='Artista')
 
-        self.tracks_scrollable_frame.bind(
-            "<Configure>",
-            lambda e: self.tracks_canvas.configure(scrollregion=self.tracks_canvas.bbox("all"))
-        )
+        # Configurar columnas
+        self.confirmed_tracks_tree.column('#0', width=100, minwidth=100)
+        self.confirmed_tracks_tree.column('name', width=200, minwidth=150)
+        self.confirmed_tracks_tree.column('artist', width=150, minwidth=100)
 
-        self.tracks_canvas.create_window((0, 0), window=self.tracks_scrollable_frame, anchor="nw")
-        self.tracks_canvas.configure(yscrollcommand=self.tracks_scrollbar.set)
+        # Scrollbar para el Treeview
+        confirmed_scrollbar = ttk.Scrollbar(self.tracks_frame, orient="vertical", command=self.confirmed_tracks_tree.yview)
+        self.confirmed_tracks_tree.configure(yscrollcommand=confirmed_scrollbar.set)
 
-        self.tracks_canvas.pack(side="left", fill="both", expand=True)
-        self.tracks_scrollbar.pack(side="right", fill="y")
+        # Empaquetar Treeview y scrollbar
+        self.confirmed_tracks_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        confirmed_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Bind eventos
+        self.confirmed_tracks_tree.bind("<Double-1>", self.play_selected_confirmed_track)
+        self.confirmed_tracks_tree.bind("<Button-3>", self.show_confirmed_track_menu)
+        self.confirmed_tracks_tree.bind("<<TreeviewSelect>>", self.on_confirmed_track_select)
+
+        # Menú contextual para canciones confirmadas
+        self.confirmed_track_menu = tk.Menu(self.root, tearoff=0)
+        self.confirmed_track_menu.add_command(label="Reproducir Vista Previa", command=self.play_selected_confirmed_track)
+        self.confirmed_track_menu.add_command(label="Ver Detalles", command=self.show_selected_confirmed_track_details)
 
         # Log area
         self.log_area = scrolledtext.ScrolledText(self.root, height=5, width=50)
@@ -160,6 +224,36 @@ class SpotifyPlaylistCreator:
         # Configurar estilos para frames seleccionados
         style = ttk.Style()
         style.configure('Selected.TFrame', background='#e0e0e0')
+        style.configure('TFrame', background='white')
+
+        # Frame para mostrar la imagen de la canción seleccionada
+        self.image_frame = ttk.Frame(self.suggestions_frame)
+        self.image_frame.pack(side=tk.RIGHT, padx=10, pady=5)
+        self.image_label = ttk.Label(self.image_frame)
+        self.image_label.pack()
+
+        # Frame para mostrar la imagen de la sugerencia seleccionada
+        self.similar_image_frame = ttk.Frame(self.similar_suggestions_frame)
+        self.similar_image_frame.pack(side=tk.RIGHT, padx=10, pady=5)
+        self.similar_image_label = ttk.Label(self.similar_image_frame)
+        self.similar_image_label.pack()
+
+        # Bind eventos para el Treeview de sugerencias similares
+        self.similar_suggestions_tree.bind("<Double-1>", lambda e: self.play_similar_suggestion())
+        self.similar_suggestions_tree.bind("<<TreeviewSelect>>", self.update_similar_selected_image)
+
+        # Frame para controles de reproducción de sugerencias similares
+        similar_playback_frame = ttk.Frame(self.similar_suggestions_frame)
+        similar_playback_frame.pack(padx=5, pady=5, fill=tk.X)
+        
+        self.similar_play_button = ttk.Button(similar_playback_frame, text="▶️ Reproducir", command=self.play_similar_suggestion)
+        self.similar_play_button.pack(side=tk.LEFT, padx=5)
+        
+        self.similar_stop_button = ttk.Button(similar_playback_frame, text="⏹️ Detener", command=self.stop_similar_preview)
+        self.similar_stop_button.pack(side=tk.LEFT, padx=5)
+        
+        self.similar_add_button = ttk.Button(similar_playback_frame, text="➕ Añadir a Playlist", command=self.add_similar_to_playlist)
+        self.similar_add_button.pack(side=tk.LEFT, padx=5)
 
     def log(self, message):
         """Append a message to the log area."""
@@ -173,7 +267,11 @@ class SpotifyPlaylistCreator:
         self.suggestions_tree.yview(*args)
 
     def setup_environment(self):
+        """Inicializa el entorno de la aplicación."""
         threading.Thread(target=connect_to_spotify, args=(self,), daemon=True).start()
+        # Inicializar el recomendador cuando se conecte a Spotify
+        if self.sp:
+            self.recommender = MusicRecommender(self.sp)
 
     def reconnect_spotify(self):
         threading.Thread(target=reconnect_spotify_api, args=(self,), daemon=True).start()
@@ -269,6 +367,47 @@ class SpotifyPlaylistCreator:
 
         self.log(f"Se mostraron {len(suggestions)} sugerencias en la tabla")
 
+    def update_similar_suggestions_ui(self, suggestions):
+        """Callback function to update the similar suggestions tree."""
+        # Limpiar el Treeview de sugerencias similares
+        for item in self.similar_suggestions_tree.get_children():
+            self.similar_suggestions_tree.delete(item)
+        
+        # Limpiar caché de imágenes
+        self.similar_images_cache.clear()
+
+        # Actualizar el Treeview con las nuevas sugerencias
+        for track in suggestions:
+            try:
+                # Crear un placeholder para la imagen
+                image_placeholder = "🖼️"
+                
+                # Insertar el track en el Treeview de sugerencias similares
+                item_id = self.similar_suggestions_tree.insert('', 'end', text=image_placeholder,
+                                                    values=(track['name'], track['artist'], track['album']),
+                                                    tags=(track['uri'],))
+                
+                # Cargar la imagen en segundo plano
+                if track.get('image_url'):
+                    try:
+                        response = requests.get(track['image_url'], stream=True)
+                        response.raise_for_status()
+                        img = Image.open(BytesIO(response.content))
+                        img = img.resize((50, 50), Image.Resampling.LANCZOS)
+                        image_tk = ImageTk.PhotoImage(img)
+                        # Guardar referencia
+                        self.similar_images_cache[item_id] = image_tk
+                        # Actualizar la imagen en el Treeview
+                        self.similar_suggestions_tree.item(item_id, image=image_tk)
+                    except Exception as e:
+                        self.log(f"Error al cargar imagen: {e}")
+
+            except Exception as e:
+                self.log(f"Error al mostrar track en la interfaz: {e}")
+                continue
+
+        self.log(f"Se mostraron {len(suggestions)} sugerencias similares en la tabla")
+
     def show_track_context_menu_list(self, event):
         """Muestra el menú contextual al hacer clic derecho en una sugerencia."""
         try:
@@ -326,85 +465,68 @@ class SpotifyPlaylistCreator:
             messagebox.showinfo("Info", "Esta canción ya está en la playlist")
 
     def insert_track_in_treeview(self, track):
-        """Inserta un track en la cuadrícula de canciones confirmadas."""
-        # Contar cuántos tracks hay en la última fila
-        current_row = len(self.tracks_scrollable_frame.winfo_children()) // 7
-        current_col = len(self.tracks_scrollable_frame.winfo_children()) % 7
-
-        frame = ttk.Frame(self.tracks_scrollable_frame)
-        frame.grid(row=current_row, column=current_col, padx=5, pady=5)
-        
-        # Añadir evento de clic para selección
-        frame.bind("<Button-1>", lambda e, f=frame: self.select_track_frame(f))
-        
-        # Guardar referencia al track en el frame
-        frame.track = track
-
-        # Cargar y mostrar la imagen primero
-        if track.get('image_url'):
-            try:
-                response = requests.get(track['image_url'], stream=True)
-                response.raise_for_status()
-                img = Image.open(BytesIO(response.content))
-                img = img.resize((100, 100), Image.Resampling.LANCZOS)
-                image_tk = ImageTk.PhotoImage(img)
-                # Guardar referencia
-                if not hasattr(self, 'confirmed_images_cache'):
-                    self.confirmed_images_cache = {}
-                self.confirmed_images_cache[track['uri']] = image_tk
-                
-                label = ttk.Label(frame, image=image_tk)
-                label.image = image_tk  # Mantener referencia
-                label.pack()
-            except Exception as e:
-                self.log(f"Error al cargar imagen: {e}")
-
-        # Mostrar nombre de la canción
-        ttk.Label(frame, text=track['name'], wraplength=100).pack()
-        
-        # Mostrar artista
-        ttk.Label(frame, text=track['artist'], wraplength=100).pack()
-
-    def select_track_frame(self, frame):
-        """Maneja la selección de un frame de track."""
-        if not hasattr(self, 'selected_frames'):
-            self.selected_frames = set()
-        
-        if frame in self.selected_frames:
-            # Deseleccionar
-            frame.configure(style='TFrame')
-            self.selected_frames.remove(frame)
-        else:
-            # Seleccionar
-            frame.configure(style='Selected.TFrame')
-            self.selected_frames.add(frame)
+        """Inserta un track en el Treeview de canciones confirmadas."""
+        try:
+            # Crear un placeholder para la imagen
+            image_placeholder = "🖼️"
+            
+            # Insertar el track en el Treeview
+            item_id = self.confirmed_tracks_tree.insert('', 'end', text=image_placeholder,
+                                                      values=(track['name'], track['artist']))
+            
+            # Cargar la imagen en segundo plano
+            if track.get('image_url'):
+                try:
+                    response = requests.get(track['image_url'], stream=True)
+                    response.raise_for_status()
+                    img = Image.open(BytesIO(response.content))
+                    img = img.resize((50, 50), Image.Resampling.LANCZOS)
+                    image_tk = ImageTk.PhotoImage(img)
+                    # Guardar referencia
+                    if not hasattr(self, 'confirmed_images_cache'):
+                        self.confirmed_images_cache = {}
+                    self.confirmed_images_cache[item_id] = image_tk
+                    # Actualizar la imagen en el Treeview
+                    self.confirmed_tracks_tree.item(item_id, image=image_tk)
+                except Exception as e:
+                    self.log(f"Error al cargar imagen: {e}")
+            
+            # Guardar referencia al track en el item
+            self.confirmed_tracks_tree.item(item_id, tags=(track['uri'],))
+            
+        except Exception as e:
+            self.log(f"Error al insertar track en Treeview: {e}")
 
     def remove_selected_tracks(self):
         """Elimina los tracks seleccionados de la lista confirmada."""
-        if not hasattr(self, 'selected_frames') or not self.selected_frames:
+        selection = self.confirmed_tracks_tree.selection()
+        if not selection:
             messagebox.showwarning("Advertencia", "No hay canciones seleccionadas para quitar.")
             return
 
         # Obtener los tracks seleccionados
-        tracks_to_remove = [frame.track for frame in self.selected_frames]
+        tracks_to_remove = []
+        for item_id in selection:
+            track_uri = self.confirmed_tracks_tree.item(item_id)['tags'][0]
+            for track in self.confirmed_tracks:
+                if track['uri'] == track_uri:
+                    tracks_to_remove.append(track)
+                    break
         
         # Eliminar los tracks de la lista confirmada
         for track in tracks_to_remove:
             if track in self.confirmed_tracks:
                 self.confirmed_tracks.remove(track)
-
-        # Limpiar la selección
-        self.selected_frames.clear()
         
         # Actualizar la vista
         self.refresh_tracks_view()
         self.log(f"Se eliminaron {len(tracks_to_remove)} canciones.")
 
     def refresh_tracks_view(self):
-        """Refresca la vista de la cuadrícula de canciones confirmadas."""
-        # Limpiar el frame
-        for widget in self.tracks_scrollable_frame.winfo_children():
-            widget.destroy()
+        """Refresca la vista del Treeview de canciones confirmadas."""
+        # Limpiar el Treeview
+        for item in self.confirmed_tracks_tree.get_children():
+            self.confirmed_tracks_tree.delete(item)
         
         # Limpiar caché de imágenes
         if hasattr(self, 'confirmed_images_cache'):
@@ -499,11 +621,352 @@ class SpotifyPlaylistCreator:
                 index = self.suggestions_tree.index(item_id)
                 if 0 <= index < len(self.track_suggestions):
                     track = self.track_suggestions[index]
-                    if track not in self.confirmed_tracks:
-                        self.confirmed_tracks.append(track)
-                        self.insert_track_in_treeview(track)
-                        self.log(f"Canción añadida a la playlist: {track['name']} - {track['artist']}")
-                    else:
-                        messagebox.showinfo("Info", "Esta canción ya está en la playlist")
+                    self.log(f"Intentando añadir canción: {track['name']} - {track['artist']}")
+                    self.log(f"URI de la canción: {track['uri']}")
+                    
+                    # Verificar que la canción existe en Spotify
+                    try:
+                        track_info = self.sp.track(track['uri'])
+                        if track_info:
+                            self.log(f"Canción encontrada en Spotify: {track_info['name']}")
+                            if track not in self.confirmed_tracks:
+                                self.confirmed_tracks.append(track)
+                                self.insert_track_in_treeview(track)
+                                self.log(f"Canción añadida a la playlist: {track['name']} - {track['artist']}")
+                            else:
+                                messagebox.showinfo("Info", "Esta canción ya está en la playlist")
+                        else:
+                            self.log("No se pudo encontrar la canción en Spotify")
+                    except Exception as e:
+                        self.log(f"Error al verificar la canción en Spotify: {str(e)}")
+                        messagebox.showerror("Error", f"Error al verificar la canción: {str(e)}")
         except Exception as e:
             self.log(f"Error al añadir canción a la playlist: {e}")
+
+    def get_similar_songs(self):
+        """Obtiene canciones similares a las de la playlist actual."""
+        if not self.confirmed_tracks:
+            messagebox.showwarning("Sin canciones", "Por favor, añade canciones a la playlist primero.")
+            return
+            
+        if not self.sp:
+            messagebox.showerror("Error", "No hay conexión con Spotify.")
+            return
+            
+        # Obtener URIs de las canciones confirmadas (máximo 5 para las semillas)
+        track_uris = [track['uri'] for track in self.confirmed_tracks[:5]]
+        
+        # Mostrar mensaje de carga
+        self.log("Buscando canciones similares...")
+        
+        # Obtener sugerencias en un hilo separado
+        threading.Thread(target=self._get_similar_songs_thread, args=(track_uris,), daemon=True).start()
+
+    def _get_similar_songs_thread(self, track_uris):
+        """Thread para obtener canciones similares."""
+        try:
+            # Obtener géneros de los artistas en la lista
+            genres = set()
+            for track in self.confirmed_tracks:
+                self.log(f"Procesando canción: {track['name']} - {track['artist']}")
+                try:
+                    # Obtener información del track
+                    track_info = self.sp.track(track['uri'])
+                    if track_info and track_info['artists']:
+                        artist = track_info['artists'][0]
+                        artist_id = artist['id']
+                        # Obtener información del artista
+                        artist_info = self.sp.artist(artist_id)
+                        if artist_info and artist_info['genres']:
+                            genres.update(artist_info['genres'])
+                            self.log(f"Géneros encontrados para {artist['name']}: {artist_info['genres']}")
+                except Exception as e:
+                    self.log(f"Error al procesar el track {track['uri']}: {str(e)}")
+            
+            if not genres:
+                self.log("No se encontraron géneros para obtener recomendaciones.")
+                return
+                
+            self.log(f"Géneros encontrados: {genres}")
+            
+            # Buscar artistas populares en estos géneros
+            suggestions = []
+            for genre in list(genres)[:3]:  # Usar hasta 3 géneros
+                try:
+                    # Buscar artistas populares en este género
+                    results = self.sp.search(q=f'genre:{genre}', type='artist', limit=10)
+                    if results and results['artists']['items']:
+                        for artist in results['artists']['items']:
+                            # Obtener las canciones más populares del artista
+                            top_tracks = self.sp.artist_top_tracks(artist['id'])
+                            if top_tracks and top_tracks['tracks']:
+                                for track in top_tracks['tracks'][:2]:  # Tomar las 2 canciones más populares
+                                    # Verificar que la canción no esté ya en la lista confirmada
+                                    if track['uri'] not in [t['uri'] for t in self.confirmed_tracks]:
+                                        track_data = {
+                                            'name': track['name'],
+                                            'artist': track['artists'][0]['name'],
+                                            'album': track['album']['name'],
+                                            'uri': track['uri'],
+                                            'image_url': track['album']['images'][-1]['url'] if track['album']['images'] else None,
+                                            'preview_url': track.get('preview_url')
+                                        }
+                                        suggestions.append(track_data)
+                                        self.log(f"Sugerencia encontrada: {track_data['name']} - {track_data['artist']} (Género: {genre})")
+                except Exception as e:
+                    self.log(f"Error al buscar artistas en el género {genre}: {str(e)}")
+            
+            if not suggestions:
+                self.log("No se encontraron nuevas sugerencias.")
+                return
+            
+            # Actualizar la interfaz
+            self.root.after(0, lambda: self.update_similar_suggestions_ui(suggestions))
+            self.log(f"Se encontraron {len(suggestions)} canciones similares.")
+            
+        except Exception as e:
+            error_msg = f"Error al obtener canciones similares: {str(e)}"
+            self.log(error_msg)
+            messagebox.showerror("Error", error_msg)
+
+    def play_preview(self):
+        """Reproduce la vista previa de la canción seleccionada."""
+        try:
+            # Primero intentar reproducir una canción confirmada seleccionada
+            selection = self.confirmed_tracks_tree.selection()
+            if selection:
+                self.play_selected_confirmed_track()
+                return
+                
+            # Si no hay canción confirmada seleccionada, intentar con las sugerencias
+            selection = self.suggestions_tree.selection()
+            if not selection:
+                messagebox.showwarning("Sin selección", "Por favor, selecciona una canción para reproducir.")
+                return
+                
+            item_id = selection[0]
+            index = self.suggestions_tree.index(item_id)
+            if 0 <= index < len(self.track_suggestions):
+                track = self.track_suggestions[index]
+                
+                # Detener reproducción actual si existe
+                self.stop_preview()
+                
+                # Obtener URL de vista previa directamente de Spotify
+                if not self.sp:
+                    messagebox.showerror("Error", "No hay conexión con Spotify.")
+                    return
+                    
+                track_info = self.sp.track(track['uri'])
+                preview_url = track_info.get('preview_url')
+                
+                if not preview_url:
+                    messagebox.showinfo("Info", "No hay vista previa disponible para esta canción.")
+                    return
+                
+                # Descargar y reproducir
+                response = requests.get(preview_url)
+                with open("temp_preview.mp3", "wb") as f:
+                    f.write(response.content)
+                
+                pygame.mixer.music.load("temp_preview.mp3")
+                pygame.mixer.music.play()
+                self.current_preview = "temp_preview.mp3"
+                
+                self.log(f"Reproduciendo: {track['name']} - {track['artist']}")
+                
+        except Exception as e:
+            self.log(f"Error al reproducir vista previa: {e}")
+
+    def stop_preview(self):
+        """Detiene la reproducción actual."""
+        try:
+            pygame.mixer.music.stop()
+            if self.current_preview:
+                import os
+                if os.path.exists(self.current_preview):
+                    os.remove(self.current_preview)
+                self.current_preview = None
+        except Exception as e:
+            self.log(f"Error al detener reproducción: {e}")
+
+    def show_confirmed_track_menu(self, event):
+        """Muestra el menú contextual para una canción confirmada."""
+        item = self.confirmed_tracks_tree.identify_row(event.y)
+        if item:
+            self.confirmed_tracks_tree.selection_set(item)
+            self.confirmed_track_menu.post(event.x_root, event.y_root)
+
+    def play_selected_confirmed_track(self):
+        """Reproduce la vista previa de la canción confirmada seleccionada o abre en Spotify."""
+        selection = self.confirmed_tracks_tree.selection()
+        if not selection:
+            messagebox.showwarning("Sin selección", "Por favor, selecciona una canción para reproducir.")
+            return
+            
+        item_id = selection[0]
+        track_uri = self.confirmed_tracks_tree.item(item_id)['tags'][0]
+        for track in self.confirmed_tracks:
+            if track['uri'] == track_uri:
+                try:
+                    # Detener reproducción actual si existe
+                    self.stop_preview()
+                    
+                    # Obtener información del track
+                    if not self.sp:
+                        messagebox.showerror("Error", "No hay conexión con Spotify.")
+                        return
+                        
+                    track_info = self.sp.track(track_uri)
+                    preview_url = track_info.get('preview_url')
+                    
+                    if preview_url:
+                        # Descargar y reproducir vista previa
+                        response = requests.get(preview_url)
+                        with open("temp_preview.mp3", "wb") as f:
+                            f.write(response.content)
+                        
+                        pygame.mixer.music.load("temp_preview.mp3")
+                        pygame.mixer.music.play()
+                        self.current_preview = "temp_preview.mp3"
+                        
+                        self.log(f"Reproduciendo vista previa: {track['name']} - {track['artist']}")
+                    else:
+                        # Si no hay vista previa, abrir en Spotify
+                        spotify_url = track_info['external_urls']['spotify']
+                        self.log(f"No hay vista previa disponible. Abriendo en Spotify: {track['name']} - {track['artist']}")
+                        webbrowser.open(spotify_url)
+                    break
+                except Exception as e:
+                    self.log(f"Error al reproducir canción: {e}")
+                    messagebox.showerror("Error", f"Error al reproducir canción: {e}")
+
+    def show_selected_confirmed_track_details(self):
+        """Muestra los detalles de la canción confirmada seleccionada."""
+        selection = self.confirmed_tracks_tree.selection()
+        if not selection:
+            messagebox.showwarning("Sin selección", "Por favor, selecciona una canción para ver sus detalles.")
+            return
+            
+        item_id = selection[0]
+        track_uri = self.confirmed_tracks_tree.item(item_id)['tags'][0]
+        threading.Thread(target=self.show_track_info, args=(track_uri,), daemon=True).start()
+
+    def on_confirmed_track_select(self, event):
+        """Maneja la selección de tracks en el Treeview de canciones confirmadas."""
+        selection = self.confirmed_tracks_tree.selection()
+        if selection:
+            item_id = selection[0]
+            track_uri = self.confirmed_tracks_tree.item(item_id)['tags'][0]
+            for track in self.confirmed_tracks:
+                if track['uri'] == track_uri:
+                    self.log(f"Canción seleccionada: {track['name']} - {track['artist']}")
+                    break
+
+    def play_similar_suggestion(self):
+        """Reproduce la vista previa de la sugerencia seleccionada."""
+        try:
+            selection = self.similar_suggestions_tree.selection()
+            if not selection:
+                messagebox.showwarning("Sin selección", "Por favor, selecciona una canción para reproducir.")
+                return
+                
+            item_id = selection[0]
+            track_uri = self.similar_suggestions_tree.item(item_id)['tags'][0]
+            
+            # Detener reproducción actual si existe
+            self.stop_similar_preview()
+            
+            # Obtener información del track
+            if not self.sp:
+                messagebox.showerror("Error", "No hay conexión con Spotify.")
+                return
+                
+            track_info = self.sp.track(track_uri)
+            preview_url = track_info.get('preview_url')
+            
+            if preview_url:
+                # Descargar y reproducir vista previa
+                response = requests.get(preview_url)
+                with open("temp_similar_preview.mp3", "wb") as f:
+                    f.write(response.content)
+                
+                pygame.mixer.music.load("temp_similar_preview.mp3")
+                pygame.mixer.music.play()
+                self.current_similar_preview = "temp_similar_preview.mp3"
+                
+                self.log(f"Reproduciendo sugerencia: {track_info['name']} - {track_info['artists'][0]['name']}")
+            else:
+                # Si no hay vista previa, abrir en Spotify
+                spotify_url = track_info['external_urls']['spotify']
+                self.log(f"No hay vista previa disponible. Abriendo en Spotify: {track_info['name']}")
+                webbrowser.open(spotify_url)
+                
+        except Exception as e:
+            self.log(f"Error al reproducir sugerencia: {e}")
+            messagebox.showerror("Error", f"Error al reproducir sugerencia: {e}")
+
+    def stop_similar_preview(self):
+        """Detiene la reproducción de la sugerencia actual."""
+        try:
+            pygame.mixer.music.stop()
+            if hasattr(self, 'current_similar_preview') and self.current_similar_preview:
+                import os
+                if os.path.exists(self.current_similar_preview):
+                    os.remove(self.current_similar_preview)
+                self.current_similar_preview = None
+        except Exception as e:
+            self.log(f"Error al detener reproducción: {e}")
+
+    def add_similar_to_playlist(self):
+        """Añade la sugerencia seleccionada a la playlist."""
+        try:
+            selection = self.similar_suggestions_tree.selection()
+            if not selection:
+                messagebox.showwarning("Sin selección", "Por favor, selecciona una canción para añadir.")
+                return
+                
+            item_id = selection[0]
+            track_uri = self.similar_suggestions_tree.item(item_id)['tags'][0]
+            
+            # Obtener información del track
+            track_info = self.sp.track(track_uri)
+            track_data = {
+                'name': track_info['name'],
+                'artist': track_info['artists'][0]['name'],
+                'album': track_info['album']['name'],
+                'uri': track_info['uri'],
+                'image_url': track_info['album']['images'][-1]['url'] if track_info['album']['images'] else None,
+                'preview_url': track_info.get('preview_url')
+            }
+            
+            if track_data not in self.confirmed_tracks:
+                self.confirmed_tracks.append(track_data)
+                self.insert_track_in_treeview(track_data)
+                self.log(f"Canción añadida a la playlist: {track_data['name']} - {track_data['artist']}")
+            else:
+                messagebox.showinfo("Info", "Esta canción ya está en la playlist")
+                
+        except Exception as e:
+            self.log(f"Error al añadir sugerencia a la playlist: {e}")
+            messagebox.showerror("Error", f"Error al añadir sugerencia: {e}")
+
+    def update_similar_selected_image(self, event):
+        """Actualiza la imagen mostrada cuando se selecciona una sugerencia."""
+        try:
+            selection = self.similar_suggestions_tree.selection()
+            if selection:
+                item_id = selection[0]
+                if hasattr(self, 'similar_images_cache') and item_id in self.similar_images_cache:
+                    self.similar_image_label.configure(image=self.similar_images_cache[item_id])
+                    self.similar_image_label.image = self.similar_images_cache[item_id]
+                else:
+                    self.similar_image_label.configure(image='')
+                    self.similar_image_label.image = None
+        except Exception as e:
+            self.log(f"Error al actualizar la imagen seleccionada: {e}")
+
+    def __del__(self):
+        """Limpieza al cerrar la aplicación."""
+        self.stop_preview()
+        pygame.mixer.quit()

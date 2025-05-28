@@ -14,7 +14,7 @@ def connect_to_spotify(app):
         auth_manager = SpotifyOAuth(
             client_id=os.getenv('SPOTIFY_CLIENT_ID'),
             client_secret=os.getenv('SPOTIFY_CLIENT_SECRET'),
-            redirect_uri='SPOTIFY_REDIRECT_URI',
+            redirect_uri='http://localhost:8888/callback',
             scope='playlist-modify-public playlist-modify-private user-read-private user-top-read'
         )
         app.sp = spotipy.Spotify(auth_manager=auth_manager)
@@ -169,7 +169,6 @@ def get_suggestions_from_api(app, artists, callback):
     except Exception as e:
         app.log(f"Error general al obtener sugerencias de Spotify: {e}")
         callback([])
-    
 
 def create_spotify_playlist(app, playlist_name, track_uris):
     if not app.sp:
